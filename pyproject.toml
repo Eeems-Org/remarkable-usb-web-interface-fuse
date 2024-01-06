@@ -1,0 +1,38 @@
+[project]
+name = "remarkable_usb_web_interface_fuse"
+version = "1.0.2"
+authors = [
+  { name="Eeems", email="eeems@eeems.email" },
+]
+description = "Userspace filesystem for remarkable usb web interface"
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Filesystems",
+    "Topic :: Utilities",
+]
+dynamic = ["dependencies", "readme"]
+
+[project.scripts]
+rmuwifuse = "remarkable_usb_web_interface_fuse.__main__:main"
+
+[tool.setuptools]
+packages = [
+    "remarkable_usb_web_interface_fuse",
+]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+readme = {file= ["README.md"], content-type = "text/markdown"}
+
+[build-system]
+requires = ["setuptools>=42", "wheel", "nuitka", "toml"]
+build-backend = "nuitka.distutils.Build"
