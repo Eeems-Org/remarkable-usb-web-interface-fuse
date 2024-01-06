@@ -4,10 +4,9 @@ import sys
 
 FAILED = False
 
-
 # root = FileHandle.root()
-# for fh in root.readdir():
-#     print(f"{fh.name}")
+# for name, file_type in root.readdir():
+#     print(f"{name}")
 
 if FAILED:
     sys.exit(1)

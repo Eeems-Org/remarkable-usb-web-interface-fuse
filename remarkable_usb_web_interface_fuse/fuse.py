@@ -84,22 +84,33 @@ class FileHandle:
 
         return res.content
 
-    @classmethod
-    def getItems(cls, parent=""):
-        for item in cls.post(f"documents/{parent}", timeout=5):
-            yield FileHandle(item)
-
-    def __init__(self, data):
-        self.data = data
+    def __init__(self, path, flags, *mode):
+        self.path = path
+        self.flags = flags
+        self.mode = mode
         self.stream = None
         self.bytes = None
+        self.data = {}
+        if path == "/":
+            self.data["Type"] = "CollectionType"
+            FileHandle._root = self
+            return
+
+        for item in self.parent._readdir():
+            if item["VissibleName"].strip() == os.path.splitext(self.name)[0]:
+                self.data = item
+
+        if self.guid is None:
+            self.bytes = io.BytesIO()
+            self.to_upload[path] = self
+            self.data["Type"] = "DocumentType"
 
     def __contains__(self, name):
         if not self.is_dir:
             return False
 
-        for item in self.readdir():
-            if item.name == name:
+        for _name, _file_type in self.readdir():
+            if name == _name:
                 return True
 
         return False
@@ -108,32 +119,32 @@ class FileHandle:
         if not self.is_dir:
             return None
 
-        for item in self.readdir():
-            if item.name == name:
-                return item
+        for _name, _file_type in self.readdir():
+            if name == _name:
+                return FileHandle(os.path.join(self.path, name), _file_type)
 
         return None
 
     def __len__(self):
+        if self.bytes is not None:
+            return len(self.bytes.getvalue())
+
         return int(self.data["sizeInBytes"]) if self.is_file else 0
 
     @staticmethod
     def root():
-        return FileHandle({"VissibleName": "", "Type": "CollectionType", "ID": ""})
+        if not hasattr(FileHandle, "_root"):
+            FileHandle("/", stat.S_IFDIR | 0o755, 0)
+
+        return FileHandle._root
 
     @property
     def guid(self):
-        return self.data["ID"]
+        return self.data["ID"] if "ID" in self.data else None
 
     @property
     def name(self):
-        name = self.data["VissibleName"].strip()
-        if self.is_dir:
-            return name
-
-        # TODO - maybe expose filetype?
-        #        pdf, epub, notebook
-        return f"{name}.pdf"
+        return os.path.basename(self.path)
 
     @property
     def is_dir(self):
@@ -148,15 +159,37 @@ class FileHandle:
         return self.stream is not None or self.bytes is not None
 
     @property
-    def mode(self):
-        return stat.S_IFDIR | 0o755 if self.is_dir else stat.S_IFREG | 0o666
+    def parent(self):
+        if not hasattr(self, "_parent"):
+            self._parent = FileHandle.root().openat(os.path.dirname(self.path))
+
+        return self._parent
+
+    def _readdir(self):
+        return self.post(f"documents/{self.guid}", timeout=5)
 
     def readdir(self):
         if not self.is_dir:
-            raise OSError(errno.EBADF, "Not a directory")
+            raise OSError(errno.EBADF, f"{self.path} is not a directory")
 
-        for item in self.getItems(self.guid):
-            yield item
+        # stat.S_IFDIR if item["Type"] == "CollectionType" else stat.S_IFREG
+
+        yield ".", stat.S_IFDIR
+        yield "..", stat.S_IFDIR
+
+        for item in self._readdir():
+            file_type = (
+                stat.S_IFDIR if item["Type"] == "CollectionType" else stat.S_IFREG
+            )
+            name = item["VissibleName"]
+            if file_type == stat.S_IFREG:
+                name += ".pdf"
+
+            yield name, file_type
+
+        for key, item in FileHandle.to_upload.items():
+            if os.path.dirname(key) == self.path:
+                yield item.name, stat.S_IFREG
 
     def open(self):
         if not self.is_file:
@@ -174,23 +207,23 @@ class FileHandle:
 
         self.stream = res
 
-    def close(self):
+    def release(self, _flags):
         if self.stream is not None:
             self.stream.close()
             self.stream = None
 
         self.bytes = None
 
-    def read(self, size=0, offset=0):
+    def read(self, size, offset):
         assert self.is_open
         assert 0 <= offset < len(self)
-        if self.bytes is not None:
-            return self.bytes[offset : offset + size]
-
-        if size <= 0:
-            size = len(self)
-
         assert size + offset <= len(self)
+        if self.bytes is not None:
+            if isinstance(self.bytes, io.BytesIO):
+                self.bytes.seek(offset)
+                return self.bytes.read(size)
+
+            return self.bytes[offset : offset + size]
 
         raw = self.stream.raw
         if raw.seekable():
@@ -199,14 +232,14 @@ class FileHandle:
 
             return raw.read(size)
 
-        self.bytes = b"".join([c for c in self.stream.iter_content(1024)])
+        self.bytes = b"".join(list(self.stream.iter_content(1024)))
         self.stream.close()
         self.stream = None
         return self.bytes
 
     def openat(self, path):
         if not self.is_dir:
-            raise OSError(errno.ENOTDIR, "Not a directory")
+            raise OSError(errno.ENOTDIR, f"{self.path} is not a directory")
 
         path = os.path.normpath(path)
         if path == "/":
@@ -226,61 +259,49 @@ class FileHandle:
 
         current = self
         for name in paths:
+            if current is None:
+                raise OSError(errno.EBADF, "Directory does not exist")
+
             if not current.is_dir:
-                raise OSError(errno.ENOTDIR, "Not a directory")
+                raise OSError(errno.ENOTDIR, f"{current.path} is not a directory")
 
             current = current[name]
-            if current is None:
-                raise OSError(errno.EBADF, "File does not exist")
 
-        return current
+        if current is not None:
+            return current
 
-    def stat(self):
+        raise OSError(errno.EBADF, f"{path} does not exist")
+
+    def fgetattr(self):
         _stat = Stat()
-        _stat.st_mode = self.mode
+        _stat.st_mode = self.flags
         _stat.st_size = len(self)
         return _stat
 
+    def write(self, buf, offset):
+        if not isinstance(self.bytes, io.BytesIO):
+            raise OSError(errno.EIO, "Not open for writing")
 
-class UploadFileHandle:
-    def __init__(self, path, mode):
-        self.mode = mode
-        self.path = path
-        self.parent = FileHandle.root().openat(os.path.dirname(path))
+        self.bytes.seek(offset)
+        return self.bytes.write(buf)
+
+    def flush(self):
         name = os.path.splitext(self.name)[0]
-        if f"{name}.pdf" in self.parent:
+        if not isinstance(self.bytes, io.BytesIO):
             raise OSError(errno.EEXIST, f"{name}.pdf already exists")
 
-        self.data = io.BytesIO()
-        self.has_written = False
-        FileHandle.to_upload[path] = self
-
-    @property
-    def name(self):
-        return os.path.basename(self.path)
-
-    def seek(self, offset):
-        self.data.seek(offset)
-
-    def write(self, data):
-        self.data.write(data)
-        self.has_written = True
-
-    def close(self):
-        if not self.has_written:
-            return
-
-        del FileHandle.to_upload[self.path]
-        name = os.path.splitext(self.name)[0]
         if f"{name}.pdf" in self.parent:
             raise OSError(errno.EEXIST, f"{name}.pdf already exists")
 
         self.parent.readdir()
-        res = self.parent.post(
+        print(f"Uploading {self.name}")
+        res = self.post(
             "upload",
-            files={"file": (self.name, self.data.getvalue())},
+            files={"file": (self.name, self.bytes.getvalue())},
+            timeout=120,
         )
-        self.data.close()
+        self.bytes.close()
+        self.bytes = self.bytes.getvalue()
         if isinstance(res, bytes):
             raise OSError(errno.EIO, f"Invalid JSON response {res}")
 
@@ -292,12 +313,6 @@ class UploadFileHandle:
 
         if res["status"] != "Upload successful":
             raise OSError(errno.EIO, res["status"])
-
-    def stat(self):
-        _stat = Stat()
-        _stat.st_mode = self.mode
-        _stat.st_size = len(self.data.getvalue())
-        return _stat
 
 
 class USBWebInterfaceFS(fuse.Fuse):
@@ -338,31 +353,12 @@ class USBWebInterfaceFS(fuse.Fuse):
             self.fuse_error("fuse: missing ipaddress parameter")
 
         FileHandle.ipaddress = self.ipaddress
+        self.file_class = FileHandle
         fuse.Fuse.main(self, args)
 
-    # def statfs(self):
-    #     struct = fuse.StatVfs()
-    #     struct.f_bsize = 0
-    #     struct.f_frsize = 0
-    #     struct.f_blocks = 0
-    #     struct.f_bfree = 0
-    #     struct.f_bavail = 0
-    #     struct.f_files = 0
-    #     struct.f_ffree = 0
-    #     struct.f_favail = 0
-    #     struct.f_flag = 0
-    #     struct.f_namemax = 0
-    #     return struct
-
-    def getattr(self, path, fh=None):
-        if path in FileHandle.to_upload:
-            return FileHandle.to_upload[path].stat()
-
+    def getattr(self, path):
         try:
-            if fh is None:
-                fh = FileHandle.root().openat(path)
-
-            return fh.stat()
+            return FileHandle.root().openat(path).fgetattr()
 
         except OSError as err:
             if err.errno == errno.EBADF:
@@ -372,75 +368,8 @@ class USBWebInterfaceFS(fuse.Fuse):
             return -err.errno
 
     def mknod(self, path, mode, __):
-        UploadFileHandle(path, mode)
+        FileHandle(path, 0, mode)
         return 0
-
-    def open(self, path, flags):
-        if path in FileHandle.to_upload:
-            mode = os.O_RDONLY | os.O_WRONLY | os.O_RDWR
-            if (flags & mode) != os.O_WRONLY:
-                return -errno.EACCES
-
-            return FileHandle.to_upload[path]
-
-        try:
-            fh = FileHandle.root().openat(path)
-            if not fh.is_file:
-                return -errno.EACCES
-
-            mode = os.O_RDONLY | os.O_WRONLY | os.O_RDWR
-            if (flags & mode) != os.O_RDONLY:
-                return -errno.EACCES
-
-            return fh
-
-        except OSError as err:
-            print(err)
-            return -err.errno
-
-    def release(self, path, __, fh=None):
-        if fh is not None:
-            fh.close()
-
-        if path in FileHandle.to_upload:
-            FileHandle.to_upload[path].close()
-
-        return 0
-
-    def read(self, path, size, offset, fh=None):
-        try:
-            if fh is None:
-                fh = FileHandle.root().openat(path)
-
-            if not fh.is_open:
-                fh.open()
-
-            return fh.read(size, offset)
-
-        except OSError as err:
-            print(err)
-            return -err.errno
-
-    def write(self, path, buf, offset, fh=None):
-        if fh is None and fh in FileHandle.to_upload:
-            fh = FileHandle.to_upload[path]
-
-        if not isinstance(fh, UploadFileHandle):
-            try:
-                if fh is None:
-                    fh = FileHandle.root().openat(path)
-
-                if fh is not None:
-                    errno.EEXIST
-
-            except OSError as err:
-                if err.errno != errno.EBADF:
-                    print(err)
-                    return -err.errno
-
-        fh = UploadFileHandle(path, 0o666)
-        fh.seek(offset)
-        fh.write(buf)
 
     def opendir(self, path):
         try:
@@ -456,7 +385,7 @@ class USBWebInterfaceFS(fuse.Fuse):
 
     def releasedir(self, _, fh=None):
         if fh is not None:
-            fh.close()
+            fh.release(0)
 
         return 0
 
@@ -473,14 +402,8 @@ class USBWebInterfaceFS(fuse.Fuse):
             if not fh.is_dir:
                 return -errno.EBADF
 
-            yield fuse.Direntry(".")
-            yield fuse.Direntry("..")
-            for item in fh.readdir():
-                yield fuse.Direntry(item.name)
-
-            for key in FileHandle.to_upload:
-                if os.path.dirname(key) == path:
-                    yield fuse.Direntry(key)
+            for name, file_type in fh.readdir():
+                yield fuse.Direntry(name, type=file_type)
 
         except OSError as err:
             print(err)
