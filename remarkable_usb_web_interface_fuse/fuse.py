@@ -2,6 +2,7 @@ import os
 import errno
 import stat
 import io
+import sys
 
 import fuse
 import requests
@@ -53,9 +54,13 @@ class Stat(fuse.Stat):
         self.st_ctime = 0
 
 
-class FileHandle:
+class HandleBase:
     ipaddress = "10.11.99.1"
-    to_upload = {}
+    root = None
+
+    @classmethod
+    def init(cls):
+        cls.root = DirHandle("/")
 
     @classmethod
     def post(cls, path, data=None, files=None, timeout=30):
@@ -88,22 +93,68 @@ class FileHandle:
         self.path = path
         self.flags = flags
         self.mode = mode
-        self.stream = None
-        self.bytes = None
-        self.data = {}
+        self.parent = None
+        if not hasattr(self, "data"):
+            self.data = {}
+
+        if path != "/":
+            self.parent = HandleBase.root.openat(os.path.dirname(path))
+
+    def __len__(self):
+        return 0
+
+    @property
+    def name(self):
+        return os.path.basename(self.path)
+
+    @property
+    def guid(self):
+        return self.data["ID"] if "ID" in self.data else None
+
+    @property
+    def is_dir(self):
+        return False
+
+    @property
+    def is_file(self):
+        return False
+
+    @property
+    def stat(self):
+        _stat = Stat()
+        _stat.st_mode = self.flags
+        _stat.st_size = len(self)
+        return _stat
+
+    @property
+    def xattrs(self):
+        return {}
+
+
+class DirHandle(HandleBase):
+    def __new__(cls, path):
         if path == "/":
-            self.data["Type"] = "CollectionType"
-            FileHandle._root = self
-            return
+            file_handle = super().__new__(cls)
+            file_handle.data = {
+                "VissibleName": "",
+                "ID": "",
+                "Type": "CollectionType",
+            }
+            return file_handle
+        name = os.path.splitext(os.path.basename(path))[0]
+        for item in HandleBase.root.openat(os.path.dirname(path)).querydir():
+            if item["VissibleName"].strip() == name:
+                if item["Type"] != "CollectionType":
+                    raise OSError(errno.EBADF, f"{path} is not a directory")
 
-        for item in self.parent._readdir():
-            if item["VissibleName"].strip() == os.path.splitext(self.name)[0]:
-                self.data = item
+                file_handle = super().__new__(cls)
+                file_handle.data = item
+                return file_handle
 
-        if self.guid is None:
-            self.bytes = io.BytesIO()
-            self.to_upload[path] = self
-            self.data["Type"] = "DocumentType"
+        raise OSError(errno.ENOENT, f"{path} does not exist")
+
+    def __init__(self, path):
+        super().__init__(path, stat.S_IFDIR | 0o755)
 
     def __contains__(self, name):
         if not self.is_dir:
@@ -116,68 +167,33 @@ class FileHandle:
         return False
 
     def __getitem__(self, name):
-        if not self.is_dir:
-            return None
+        path = os.path.join(self.path, name)
+        for _name, file_type in self.readdir():
+            if name != _name:
+                continue
 
-        for _name, _file_type in self.readdir():
-            if name == _name:
-                return FileHandle(os.path.join(self.path, name), _file_type)
+            if file_type == stat.S_IFREG:
+                return FileHandle(path, file_type | 0o444, 0)
+
+            return DirHandle(path)
 
         return None
 
-    def __len__(self):
-        if self.bytes is not None:
-            return len(self.bytes.getvalue())
-
-        return int(self.data["sizeInBytes"]) if self.is_file else 0
-
-    @staticmethod
-    def root():
-        if not hasattr(FileHandle, "_root"):
-            FileHandle("/", stat.S_IFDIR | 0o755, 0)
-
-        return FileHandle._root
-
-    @property
-    def guid(self):
-        return self.data["ID"] if "ID" in self.data else None
-
-    @property
-    def name(self):
-        return os.path.basename(self.path)
-
     @property
     def is_dir(self):
-        return self.data["Type"] == "CollectionType"
+        return True
 
-    @property
-    def is_file(self):
-        return self.data["Type"] == "DocumentType"
-
-    @property
-    def is_open(self):
-        return self.stream is not None or self.bytes is not None
-
-    @property
-    def parent(self):
-        if not hasattr(self, "_parent"):
-            self._parent = FileHandle.root().openat(os.path.dirname(self.path))
-
-        return self._parent
-
-    def _readdir(self):
+    def querydir(self):
         return self.post(f"documents/{self.guid}", timeout=5)
 
     def readdir(self):
         if not self.is_dir:
             raise OSError(errno.EBADF, f"{self.path} is not a directory")
 
-        # stat.S_IFDIR if item["Type"] == "CollectionType" else stat.S_IFREG
-
         yield ".", stat.S_IFDIR
         yield "..", stat.S_IFDIR
 
-        for item in self._readdir():
+        for item in self.querydir():
             file_type = (
                 stat.S_IFDIR if item["Type"] == "CollectionType" else stat.S_IFREG
             )
@@ -191,59 +207,13 @@ class FileHandle:
             if os.path.dirname(key) == self.path:
                 yield item.name, stat.S_IFREG
 
-    def open(self):
-        if not self.is_file:
-            raise OSError(errno.EBADF, "Not a file")
-
-        if self.is_open:
-            return
-
-        url = f"http://{self.ipaddress}/download/{self.guid}/placeholder"
-        res = requests.get(url, timeout=30, stream=True)
-        if "content-length" not in res.headers:
-            print(res.headers)
-            res.close()
-            raise OSError(errno.EBADF, "Content-Length missing")
-
-        self.stream = res
-
-    def release(self, _flags):
-        if self.stream is not None:
-            self.stream.close()
-            self.stream = None
-
-        self.bytes = None
-
-    def read(self, size, offset):
-        assert self.is_open
-        assert 0 <= offset < len(self)
-        assert size + offset <= len(self)
-        if self.bytes is not None:
-            if isinstance(self.bytes, io.BytesIO):
-                self.bytes.seek(offset)
-                return self.bytes.read(size)
-
-            return self.bytes[offset : offset + size]
-
-        raw = self.stream.raw
-        if raw.seekable():
-            if offset > 0:
-                raw.seek(offset)
-
-            return raw.read(size)
-
-        self.bytes = b"".join(list(self.stream.iter_content(1024)))
-        self.stream.close()
-        self.stream = None
-        return self.bytes
-
     def openat(self, path):
         if not self.is_dir:
             raise OSError(errno.ENOTDIR, f"{self.path} is not a directory")
 
         path = os.path.normpath(path)
         if path == "/":
-            return self.root()
+            return self.root
 
         paths = tuple()
         while True:
@@ -272,11 +242,111 @@ class FileHandle:
 
         raise OSError(errno.EBADF, f"{path} does not exist")
 
-    def fgetattr(self):
-        _stat = Stat()
-        _stat.st_mode = self.flags
-        _stat.st_size = len(self)
-        return _stat
+
+class FileHandle(HandleBase):
+    to_upload = {}
+
+    def __new__(cls, path, flags, *mode):
+        if path in cls.to_upload:
+            return cls.to_upload[path]
+
+        return super().__new__(cls)
+
+    def __init__(self, path, flags, *mode):
+        super().__init__(path, flags, *mode)
+        if not hasattr(self, "stream"):
+            self.stream = None
+            self.bytes = None
+            name = os.path.splitext(os.path.basename(path))[0]
+            if flags & os.O_CREAT != 0:
+                self.data = {"Type": "DocumentType", "VissibleName": name}
+
+        if not self.data:
+            for item in self.parent.querydir():
+                if item["VissibleName"].strip() != name:
+                    continue
+
+                if item["Type"] != "DocumentType":
+                    raise OSError(errno.EBADF, f"{path} is not a file")
+
+                self.data = item
+                break
+
+            if not self.data:
+                raise OSError(errno.ENOENT, f"{path} does not exist")
+
+        if self.guid is None and self.bytes is None:
+            self.bytes = io.BytesIO()
+            self.to_upload[path] = self
+            self.data["Type"] = "DocumentType"
+
+    def __len__(self):
+        if not self.is_file:
+            return 0
+
+        if "sizeInBytes" in self.data:
+            return int(self.data["sizeInBytes"])
+
+        if self.bytes is None:
+            return 0
+
+        if isinstance(self.bytes, io.BytesIO):
+            return len(self.bytes.getvalue())
+
+        return len(self.bytes)
+
+    @property
+    def is_file(self):
+        return True
+
+    @property
+    def is_open(self):
+        return self.stream is not None or self.bytes is not None
+
+    def open(self):
+        if not self.is_file:
+            raise OSError(errno.EBADF, "Not a file")
+
+    def release(self, _flags=None):
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
+
+        if isinstance(self.bytes, io.BytesIO):
+            self.upload()
+
+        self.bytes = None
+
+    def read(self, size, offset):
+        assert 0 <= offset < len(self)
+        assert size + offset <= len(self)
+        if self.bytes is not None:
+            if isinstance(self.bytes, io.BytesIO):
+                self.bytes.seek(offset)
+                return self.bytes.read(size)
+
+            return self.bytes[offset : offset + size]
+
+        if self.stream is None:
+            url = f"http://{self.ipaddress}/download/{self.guid}/placeholder"
+            res = requests.get(url, timeout=60, stream=True)
+            if "content-length" not in res.headers:
+                res.close()
+                raise OSError(errno.EBADF, "Content-Length missing")
+
+            self.stream = res
+
+        raw = self.stream.raw
+        if raw.seekable():
+            if offset > 0:
+                raw.seek(offset)
+
+            return raw.read(size)
+
+        self.bytes = b"".join(list(self.stream.iter_content(1024)))
+        self.stream.close()
+        self.stream = None
+        return self.bytes
 
     def write(self, buf, offset):
         if not isinstance(self.bytes, io.BytesIO):
@@ -285,22 +355,23 @@ class FileHandle:
         self.bytes.seek(offset)
         return self.bytes.write(buf)
 
-    def flush(self):
-        name = os.path.splitext(self.name)[0]
+    def upload(self):
+        split = os.path.splitext(self.name)
+        name = split[0]
         if not isinstance(self.bytes, io.BytesIO):
+            raise OSError(errno.EEXIST, f"{name} bytes are not BytesIO")
+
+        if ".pdf" != split[1] and f"{name}.pdf" in self.parent:
             raise OSError(errno.EEXIST, f"{name}.pdf already exists")
 
-        if f"{name}.pdf" in self.parent:
-            raise OSError(errno.EEXIST, f"{name}.pdf already exists")
-
-        self.parent.readdir()
+        self.parent.querydir()
         print(f"Uploading {self.name}")
+        assert len(self.bytes.getvalue())
         res = self.post(
             "upload",
             files={"file": (self.name, self.bytes.getvalue())},
             timeout=120,
         )
-        self.bytes.close()
         self.bytes = self.bytes.getvalue()
         if isinstance(res, bytes):
             raise OSError(errno.EIO, f"Invalid JSON response {res}")
@@ -314,13 +385,15 @@ class FileHandle:
         if res["status"] != "Upload successful":
             raise OSError(errno.EIO, res["status"])
 
+        del self.to_upload[self.path]
+
 
 class USBWebInterfaceFS(fuse.Fuse):
     version = "%prog " + fuse.__version__
     fusage = "%prog update_file mountpoint [options]"
-    dash_s_do = "setsingle"
 
     def __init__(self, *args, **kw):
+        kw["dash_s_do"] = "setsingle"
         fuse.Fuse.__init__(
             self,
             *args,
@@ -328,6 +401,7 @@ class USBWebInterfaceFS(fuse.Fuse):
             parser_class=FuseOptParse,
             **kw,
         )
+        HandleBase.init()
 
     @property
     def mountpoint(self):
@@ -353,58 +427,95 @@ class USBWebInterfaceFS(fuse.Fuse):
             self.fuse_error("fuse: missing ipaddress parameter")
 
         FileHandle.ipaddress = self.ipaddress
-        self.file_class = FileHandle
         fuse.Fuse.main(self, args)
 
     def getattr(self, path):
         try:
-            return FileHandle.root().openat(path).fgetattr()
+            return HandleBase.root.openat(path).stat
 
         except OSError as err:
-            if err.errno == errno.EBADF:
-                return -errno.ENOENT
+            if err.errno != errno.EBADF:
+                print(err)
+                raise
 
-            print(err)
-            return -err.errno
+        return -errno.ENOENT
 
-    def mknod(self, path, mode, __):
-        FileHandle(path, 0, mode)
-        return 0
-
-    def opendir(self, path):
+    def create(self, path, flags, mode):
         try:
-            fh = FileHandle.root().openat(path)
-            if not fh.is_dir:
-                return -errno.EBADF
-
-            return fh
+            HandleBase.root.openat(path)
+            return -errno.EEXIST
 
         except OSError as err:
-            print(err)
-            return -err.errno
+            if err.errno != errno.EBADF:
+                print(err)
+                raise
 
-    def releasedir(self, _, fh=None):
-        if fh is not None:
-            fh.release(0)
+        FileHandle(path, flags, mode)
 
-        return 0
+    def readdir(self, path, _offset):
+        for name, file_type in DirHandle(path).readdir():
+            yield fuse.Direntry(name, type=file_type)
 
-    def readdir(self, path, _, fh=None):
-        # get or create fh
-        # if not exists path:
-        #    return -errno.ENOENT
-        # for name in fh:
-        #     yield fuse.Direntry(name)
+    def open(self, path, flags):
         try:
-            if fh is None:
-                fh = FileHandle.root().openat(path)
-
-            if not fh.is_dir:
-                return -errno.EBADF
-
-            for name, file_type in fh.readdir():
-                yield fuse.Direntry(name, type=file_type)
+            HandleBase.root.openat(path).open()
+            return
 
         except OSError as err:
+            if err.errno != errno.EBADF:
+                print(err)
+                raise
+
+        FileHandle(path, flags).open()
+
+    def release(self, path, flags):
+        try:
+            HandleBase.root.openat(path).release(flags)
+        except OSError as err:
             print(err)
-            return -err.errno
+            raise
+
+    def read(self, path, size, offset):
+        try:
+            return HandleBase.root.openat(path).read(size, offset)
+        except OSError as err:
+            print(err)
+            raise
+
+    def write(self, path, buf, offset):
+        try:
+            return HandleBase.root.openat(path).write(buf, offset)
+        except OSError as err:
+            print(err)
+            raise
+
+    def setxattr(self, path, name, value, size, flags):
+        print(f"setxattr {path} {name} {value} {size} {flags:o}")
+        # HandleBase.root.openat(path).xattrs[name] = value
+        return -errno.ENOTSUP
+
+    def listxattr(self, path, size):
+        print(f"listxattr {path} {size}")
+        xattrs = HandleBase.root.openat(path).xattrs.keys()
+        if not size:
+            return len("".join(xattrs)) + len(xattrs)
+
+        return xattrs
+
+    def getxattr(self, path, name, size):
+        print(f"getxattr {path} {name} {size}")
+        xattrs = HandleBase.root.openat(path).xattrs
+        if name not in xattrs:
+            return -errno.ENODATA
+
+        xattr = xattrs[name]
+        if not size:
+            return len(xattr)
+
+        return xattr
+
+    def unlink(self, path):
+        if path not in self.to_upload:
+            return -errno.EACCES
+
+        del self.to_upload[path]

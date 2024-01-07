@@ -107,6 +107,8 @@ dev: .venv/bin/activate $(OBJ)
 	python -m remarkable_usb_web_interface_fuse \
 	    -d \
 	    -f \
+	    -s \
+	    -o auto_unmount \
 	    10.11.99.1 \
 	    .venv/mnt
 

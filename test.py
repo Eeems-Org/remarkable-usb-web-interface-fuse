@@ -4,8 +4,8 @@ import sys
 
 FAILED = False
 
-# root = FileHandle.root()
-# for name, file_type in root.readdir():
+# FileHandle.init()
+# for name, file_type in FileHandle.root.readdir():
 #     print(f"{name}")
 
 if FAILED:
