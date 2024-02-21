@@ -1,6 +1,6 @@
 [project]
 name = "remarkable_usb_web_interface_fuse"
-version = "1.0.2"
+version = "1.0.0"
 authors = [
   { name="Eeems", email="eeems@eeems.email" },
 ]
