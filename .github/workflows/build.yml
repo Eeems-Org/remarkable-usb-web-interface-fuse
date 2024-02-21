@@ -1,0 +1,264 @@
+name: Check and Build
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [released]
+permissions: read-all
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Apt packages
+        id: cache-apt
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          execute_install_scripts: true
+          packages: libfuse-dev
+          version: 1.0
+      - name: Checkout the Git repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Cache test files
+        uses: actions/cache@v3
+        with:
+          path: |
+            .venv/bin/codexctl.bin
+            .venv/*_reMarkable2-*.signed
+          key: test-files-${{ hashFiles('Makefile') }}
+      - name: Run tests
+        run: make test
+  build-executable-ubuntu:
+    name: Build binary for ubuntu
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Apt packages
+        id: cache-apt
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          execute_install_scripts: true
+          packages: libfuse-dev ccache
+          version: 1.0
+      - name: Checkout the Git repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Nuitka ccache
+        uses: actions/cache@v3
+        with:
+          path: ${{ github.workspace }}/.nuitka
+          key: ${{ github.job }}-ccache-ubuntu-latest
+      - name: Build with nuitka
+        run: make executable
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rmufuse-ubuntu
+          path: dist
+          if-no-files-found: error
+  build-executable-alpine:
+    name: Build binary for alpine
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the Git repository
+        uses: actions/checkout@v4
+      - uses: jirutka/setup-alpine@v1
+        with:
+          branch: v3.18
+          packages: >
+            build-base
+            python3
+            python3-dev
+            py3-pip
+            py3-wheel
+            ccache
+            fuse-dev
+            git
+            patchelf
+      - name: Nuitka ccache
+        uses: actions/cache@v3
+        with:
+          path: ${{ github.workspace }}/.nuitka
+          key: ${{ github.job }}-ccache-alpine-v3.18
+      - name: Build with nuitka
+        shell: alpine.sh {0}
+        run: make executable
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rmufuse-alpine
+          path: dist
+          if-no-files-found: error
+  build-executable-remarkable:
+    name: Build binary for reMarkable
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the Git repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Nuitka ccache
+        uses: actions/cache@v3
+        with:
+          path: ${{ github.workspace }}/.nuitka
+          key: ${{ github.job }}-ccache-remarkable-2.15.1
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build with nuitka
+        run: |
+          docker run \
+            --rm \
+            --platform=linux/arm/v7 \
+            -v "${src_path}":/src \
+            eeems/nuitka-arm-builder:bullseye-3.11 \
+            bash -ec "$script" \
+          | while read -r line; do
+            if [[ "$line" == 'Nuitka'*':ERROR:'* ]]; then
+              echo "::error file=${{ steps.args.outputs.main_file }},title=Nuitka Error::$line"
+            elif [[ "$line" == 'Nuitka'*':WARNING:'* ]]; then
+              echo "::warning file=${{ steps.args.outputs.main_file }},title=Nuitka Warning::$line"
+            elif [[ "$line" == 'Nuitka:INFO:'* ]]; then
+              echo "$line"
+            else
+              echo "::debug::$line"
+            fi
+          done
+        env:
+          src_path: ${{ github.workspace }}
+          script: |
+            apt update
+            apt install -y \
+              libfuse-dev
+            cp -a /opt/lib/nuitka .venv
+            source /opt/lib/nuitka/bin/activate
+            pip install --upgrade pip
+            make -C /src executable
+      - uses: actions/upload-artifact@v3
+        with:
+          name: rmufuse-remarkable
+          path: dist
+          if-no-files-found: error
+  build-wheel:
+    name: Build wheel with python ${{ matrix.python }}
+    needs: [test]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python:
+          - '3.11'
+    steps:
+      - name: Checkout the Git repository
+        uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python }}
+          cache: 'pip'
+      - name: Install build tool
+        run: pip install build
+      - name: Building package
+        run: make wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pip-wheel-${{ matrix.python }}
+          path: dist/*
+          if-no-files-found: error
+  build-sdist:
+    name: Build sdist
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the Git repository
+        uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install build tool
+        run: pip install build
+      - name: Building package
+        run: make sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pip-sdist
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    name: Publish to PyPi
+    if: github.repository == 'Eeems-Org/remarkable-usb-web-interface-fuse' && github.event_name == 'release' && startsWith(github.ref, 'refs/tags')
+    needs: [build-sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/remarkable_usb_web_interface_fuse
+    steps:
+      - name: Download pip packages
+        id: download
+        uses: actions/download-artifact@v4
+        with:
+          name: pip-sdist
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: ${{ steps.download.outputs.download-path }}
+          skip-existing: true
+  release:
+    name: Add ${{ matrix.artifact }} to release
+    if: github.repository == 'Eeems-Org/remarkable-usb-web-interface-fuse' && github.event_name == 'release' && startsWith(github.ref, 'refs/tags')
+    needs:
+      - build-executable-ubuntu
+      - build-executable-alpine
+      - build-executable-remarkable
+      - build-wheel
+      - build-sdist
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        artifact:
+          - 'rmufuse-ubuntu'
+          - 'rmufuse-alpine'
+          - 'rmufuse-remarkable'
+          - 'pip-sdist'
+          - 'pip-wheel-3.11'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the Git repository
+        uses: actions/checkout@v4
+      - name: Download executable
+        id: download
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - name: Upload to release
+        run:
+          if [ -f rmufuse ]; then
+            name="rmufuse-${{ matrix.artifact }}"
+            mv rmufuse "$name"
+            gh release upload "$TAG" "$name" --clobber
+          else
+            find . -type f | xargs -rI {} gh release upload "$TAG" {} --clobber
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        working-directory: ${{ steps.download.outputs.download-path }}
