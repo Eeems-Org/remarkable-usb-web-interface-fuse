@@ -62,7 +62,7 @@ jobs:
         run: make executable
       - uses: actions/upload-artifact@v4
         with:
-          name: rmufuse-ubuntu
+          name: rmuwifuse-ubuntu
           path: dist
           if-no-files-found: error
   build-executable-alpine:
@@ -95,7 +95,7 @@ jobs:
         run: make executable
       - uses: actions/upload-artifact@v4
         with:
-          name: rmufuse-alpine
+          name: rmuwifuse-alpine
           path: dist
           if-no-files-found: error
   build-executable-remarkable:
@@ -149,7 +149,7 @@ jobs:
             make -C /src executable
       - uses: actions/upload-artifact@v3
         with:
-          name: rmufuse-remarkable
+          name: rmuwifuse-remarkable
           path: dist
           if-no-files-found: error
   build-wheel:
@@ -233,9 +233,9 @@ jobs:
     strategy:
       matrix:
         artifact:
-          - 'rmufuse-ubuntu'
-          - 'rmufuse-alpine'
-          - 'rmufuse-remarkable'
+          - 'rmuwifuse-ubuntu'
+          - 'rmuwifuse-alpine'
+          - 'rmuwifuse-remarkable'
           - 'pip-sdist'
           - 'pip-wheel-3.11'
     permissions:
@@ -251,9 +251,9 @@ jobs:
           path: dist
       - name: Upload to release
         run:
-          if [ -f rmufuse ]; then
-            name="rmufuse-${{ matrix.artifact }}"
-            mv rmufuse "$name"
+          if [ -f rmuwifuse ]; then
+            name="rmuwifuse-${{ matrix.artifact }}"
+            mv rmuwifuse "$name"
             gh release upload "$TAG" "$name" --clobber
           else
             find . -type f | xargs -rI {} gh release upload "$TAG" {} --clobber
